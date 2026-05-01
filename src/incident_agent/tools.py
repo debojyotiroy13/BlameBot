@@ -1,11 +1,12 @@
 """Tool functions exposed to the incident-response agent."""
 from __future__ import annotations
 
+import json
 import os
 import re
-from pathlib import Path
 from typing import Any
 
+import requests
 from github import Auth, Github
 from github.GithubException import UnknownObjectException
 
@@ -22,23 +23,73 @@ def _get_repo():
 
 
 def search_logs(query: str, max_results: int = 50) -> list[dict[str, Any]]:
-    """Return log lines matching `query` (regex, case-insensitive; falls back to literal)."""
-    log_path = Path(os.environ["LOG_FILE_PATH"])
-    if not log_path.exists():
-        return [{"error": f"Log file not found: {log_path}"}]
-
+    """Return log lines from Fly.io matching `query` (regex, case-insensitive; falls back to literal)."""
     try:
         pattern = re.compile(query, re.IGNORECASE)
     except re.error:
         pattern = re.compile(re.escape(query), re.IGNORECASE)
 
+    token = os.environ.get("FLY_API_TOKEN", "")
+    app_name = os.environ.get("FLY_APP_NAME", "svadesha-api")
+
+    if not token:
+        return [{"error": "FLY_API_TOKEN not set. Get your token with: flyctl auth token"}]
+
+    url = f"https://api.machines.dev/v1/apps/{app_name}/logs"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "text/event-stream",
+    }
+
     matches: list[dict[str, Any]] = []
-    with log_path.open("r", encoding="utf-8", errors="replace") as f:
-        for line_no, line in enumerate(f, start=1):
-            if pattern.search(line):
-                matches.append({"line": line_no, "text": line.rstrip("\n")})
-                if len(matches) >= max_results:
+    scanned = 0
+
+    try:
+        with requests.get(url, headers=headers, stream=True, timeout=15) as resp:
+            if resp.status_code == 401:
+                return [{"error": "Fly.io auth failed. Refresh your token: flyctl auth token"}]
+            if resp.status_code == 404:
+                return [{"error": f"App '{app_name}' not found on Fly.io. Check FLY_APP_NAME."}]
+            resp.raise_for_status()
+
+            for raw in resp.iter_lines(decode_unicode=True):
+                if not raw or not raw.startswith("data: "):
+                    continue
+                data_str = raw[6:].strip()
+                if not data_str:
+                    continue
+                try:
+                    event = json.loads(data_str)
+                    if not isinstance(event, dict):
+                        continue
+                    # Fly.io SSE shape: {"event":"log","data":{...}} or flat {message, timestamp, level}
+                    nested = event.get("data")
+                    payload = nested if isinstance(nested, dict) else event
+                    msg = payload.get("message", "")
+                    if not msg:
+                        continue
+                    scanned += 1
+                    ts = payload.get("timestamp", "")
+                    level = payload.get("level", "")
+                    text = f"[{ts}] [{level}] {msg}" if ts else msg
+                    if pattern.search(text):
+                        matches.append({"line": scanned, "text": text})
+                        if len(matches) >= max_results:
+                            break
+                except json.JSONDecodeError:
+                    continue
+
+                if scanned >= 2000:  # cap at 2000 lines per call
                     break
+
+    except requests.exceptions.Timeout:
+        if not matches:
+            return [{"error": "Timed out fetching Fly.io logs. The app may be idle or the token expired."}]
+    except requests.exceptions.RequestException as e:
+        return [{"error": f"Failed to fetch Fly.io logs: {e}"}]
+
+    if not matches:
+        return [{"info": f"No log lines matched '{query}' in the last {scanned} entries."}]
     return matches
 
 
@@ -108,10 +159,11 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "function": {
             "name": "search_logs",
             "description": (
-                "Search the application log file for lines matching a query. "
-                "The query is treated as a case-insensitive regex; if regex compilation fails, "
-                "it falls back to a literal substring match. Use this to find errors, stack "
-                "traces, request IDs, or specific events around the time of the incident."
+                "Search the live Fly.io application logs for lines matching a query. "
+                "Streams up to 2000 recent log lines from the app and filters them. "
+                "The query is treated as a case-insensitive regex; falls back to literal match. "
+                "Use this to find errors, stack traces, request IDs, or specific events "
+                "around the time of the incident."
             ),
             "parameters": {
                 "type": "object",
