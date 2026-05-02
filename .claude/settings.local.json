@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 -c \"from src.incident_agent.agent import investigate; from src.incident_agent.cli import main; print\\('agent + cli OK'\\)\")"
+    ]
+  }
+}

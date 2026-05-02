@@ -1,6 +1,7 @@
 """Tool functions exposed to the incident-response agent."""
 from __future__ import annotations
 
+import datetime
 import json
 import os
 import re
@@ -20,6 +21,16 @@ def _get_repo():
         repo_name = os.environ["GITHUB_REPO"]
         _repo = Github(auth=Auth.Token(token)).get_repo(repo_name)
     return _repo
+
+
+def _target_branch() -> str:
+    """Branch to investigate and open PRs against.
+
+    Reads GITHUB_BRANCH from the environment; falls back to the repo's
+    default branch so existing setups that don't set the var keep working.
+    """
+    explicit = os.environ.get("GITHUB_BRANCH", "").strip()
+    return explicit if explicit else _get_repo().default_branch
 
 
 def search_logs(query: str, max_results: int = 50) -> list[dict[str, Any]]:
@@ -64,7 +75,7 @@ def get_file(path: str, ref: str = "HEAD") -> str:
     """Fetch a file from the configured GitHub repo at the given ref."""
     repo = _get_repo()
     if ref == "HEAD":
-        ref = repo.default_branch
+        ref = _target_branch()
     try:
         contents = repo.get_contents(path, ref=ref)
     except UnknownObjectException:
@@ -88,7 +99,7 @@ def get_file(path: str, ref: str = "HEAD") -> str:
 def get_recent_commits(n: int = 10, branch: str | None = None) -> list[dict[str, Any]]:
     """Return the n most recent commits on the given branch (default: repo default branch)."""
     repo = _get_repo()
-    branch = branch or repo.default_branch
+    branch = branch or _target_branch()
     out: list[dict[str, Any]] = []
     for i, c in enumerate(repo.get_commits(sha=branch)):
         if i >= n:
@@ -118,6 +129,57 @@ def get_diff(sha: str) -> str:
             parts.append(f.patch)
         parts.append("")
     return "\n".join(parts)
+
+
+def create_fix_pr(
+    title: str,
+    body: str,
+    file_path: str,
+    new_content: str,
+    base_branch: str | None = None,
+) -> dict[str, Any]:
+    """Open a GitHub PR on a new branch with a single-file fix."""
+    repo = _get_repo()
+    base = base_branch or _target_branch()
+
+    # Create a timestamped branch so multiple runs don't collide
+    ts = datetime.datetime.utcnow().strftime("%Y%m%d-%H%M%S")
+    branch_name = f"blamebot/fix-{ts}"
+
+    base_sha = repo.get_branch(base).commit.sha
+    repo.create_git_ref(f"refs/heads/{branch_name}", base_sha)
+
+    # Commit the corrected file
+    try:
+        existing = repo.get_contents(file_path, ref=base)
+        repo.update_file(
+            path=file_path,
+            message=f"fix: {title}",
+            content=new_content,
+            sha=existing.sha,
+            branch=branch_name,
+        )
+    except UnknownObjectException:
+        repo.create_file(
+            path=file_path,
+            message=f"fix: {title}",
+            content=new_content,
+            branch=branch_name,
+        )
+
+    pr = repo.create_pull(
+        title=title,
+        body=body,
+        head=branch_name,
+        base=base,
+    )
+
+    return {
+        "pr_url": pr.html_url,
+        "pr_number": pr.number,
+        "branch": branch_name,
+        "file_changed": file_path,
+    }
 
 
 TOOL_SCHEMAS: list[dict[str, Any]] = [
@@ -219,6 +281,49 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "create_fix_pr",
+            "description": (
+                "Open a GitHub pull request on a new branch containing the fix. "
+                "Call this once — only after you are confident in the root cause. "
+                "Use get_file first to read the current file content, apply your fix, "
+                "then pass the complete corrected file here. The PR body should include "
+                "your full analysis: root cause, evidence citations, and fix explanation. "
+                "Do NOT call this tool more than once."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "title": {
+                        "type": "string",
+                        "description": "Short PR title, e.g. 'fix: restore database pool size to 20'.",
+                    },
+                    "body": {
+                        "type": "string",
+                        "description": (
+                            "Full PR description. Include: likely root cause, evidence (log lines, "
+                            "commit SHAs, file paths), and a clear explanation of what the fix changes and why."
+                        ),
+                    },
+                    "file_path": {
+                        "type": "string",
+                        "description": "Repo-relative path to the file being fixed, e.g. 'src/config/db.py'.",
+                    },
+                    "new_content": {
+                        "type": "string",
+                        "description": "Complete new content of the file after the fix is applied.",
+                    },
+                    "base_branch": {
+                        "type": "string",
+                        "description": "Branch to open the PR against. Defaults to the repo's default branch.",
+                    },
+                },
+                "required": ["title", "body", "file_path", "new_content"],
+            },
+        },
+    },
 ]
 
 
@@ -227,4 +332,5 @@ TOOL_DISPATCH = {
     "get_file": get_file,
     "get_recent_commits": get_recent_commits,
     "get_diff": get_diff,
+    "create_fix_pr": create_fix_pr,
 }

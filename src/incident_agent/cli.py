@@ -2,11 +2,37 @@
 from __future__ import annotations
 
 import argparse
+import datetime
+import logging
 import sys
+from pathlib import Path
 
 from dotenv import load_dotenv
 
 from .agent import investigate
+
+
+def _setup_logging(log_path: Path) -> None:
+    """Two handlers on the 'blamebot' logger:
+    - Console (stdout): INFO and above — iteration headers, tool names, PR URL, final result.
+    - File:            DEBUG and above — everything above plus full messages.append JSON.
+    """
+    logger = logging.getLogger("blamebot")
+    logger.setLevel(logging.DEBUG)
+    logger.propagate = False  # don't double-print via the root logger
+
+    fmt = logging.Formatter("%(message)s")
+
+    console = logging.StreamHandler(sys.stdout)
+    console.setLevel(logging.INFO)
+    console.setFormatter(fmt)
+
+    file_handler = logging.FileHandler(log_path, encoding="utf-8")
+    file_handler.setLevel(logging.DEBUG)
+    file_handler.setFormatter(fmt)
+
+    logger.addHandler(console)
+    logger.addHandler(file_handler)
 
 
 def main() -> int:
@@ -33,11 +59,27 @@ def main() -> int:
     if not description:
         parser.error("No incident description provided.")
 
-    final = investigate(description, max_iterations=args.max_iterations)
+    # Set up timestamped log file before anything else runs
+    ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    log_dir = Path("logs")
+    log_dir.mkdir(exist_ok=True)
+    log_path = log_dir / f"investigation-{ts}.log"
+    _setup_logging(log_path)
+
+    final, pr_url = investigate(description, max_iterations=args.max_iterations)
+
     print("\n" + "=" * 60)
     print("FINAL ANALYSIS")
     print("=" * 60)
     print(final)
+    if pr_url:
+        print("\n" + "=" * 60)
+        print("PULL REQUEST")
+        print("=" * 60)
+        print(f"  {pr_url}")
+        print("  Review and merge when ready.")
+
+    print(f"\nLog saved → {log_path.resolve()}")
     return 0
 
 
