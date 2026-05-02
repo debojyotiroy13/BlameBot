@@ -152,6 +152,20 @@ def create_fix_pr(
     # Commit the corrected file
     try:
         existing = repo.get_contents(file_path, ref=base)
+
+        # Guard: abort before creating an empty PR
+        current_content = existing.decoded_content.decode("utf-8", errors="replace")
+        if current_content == new_content:
+            # Clean up the dangling branch before returning the error
+            repo.get_git_ref(f"heads/{branch_name}").delete()
+            return {
+                "error": (
+                    f"new_content is identical to '{file_path}' on '{base}' — "
+                    "nothing would change. Re-read the file carefully, apply the fix, "
+                    "and call create_fix_pr again with the corrected content."
+                )
+            }
+
         repo.update_file(
             path=file_path,
             message=f"fix: {title}",
